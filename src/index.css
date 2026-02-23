@@ -14,4 +14,16 @@ body {
   .font-arabic {
     font-family: 'Amiri', 'Traditional Arabic', 'Arial Unicode MS', serif;
   }
+ 
+  /* Safe-area helpers for iOS home-screen (notch / dynamic island) */
+  .safe-top {
+    padding-top: env(safe-area-inset-top);
+    padding-top: constant(safe-area-inset-top);
+  }
+
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-bottom: constant(safe-area-inset-bottom);
+  }
+
 }

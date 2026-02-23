@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { onAuthChange, signInWithGoogle, signOut as fbSignOut, saveUserData, loadUserData, auth } from "./firebase";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -451,6 +452,7 @@ function ScoreBar({ label, pct }: { label: string; pct: number }) {
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>("dark");
+  const [user, setUser] = useState<any>(null);
   const [mode, setMode] = useState<Mode>("annual");
   const [tab, setTab] = useState<Tab>("today");
   const [appData, setAppData] = useState<AppData>(loadData);
@@ -468,6 +470,9 @@ export default function App() {
   const [locationSearching, setLocationSearching] = useState(false);
   const [countdown, setCountdown] = useState<{ label: string; secs: number } | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [swWaiting, setSwWaiting] = useState<ServiceWorker | null>(null);
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const refreshingRef = useRef(false);
 
   // Load cached prayer times on mount, then fetch fresh
   useEffect(() => {
@@ -477,6 +482,41 @@ export default function App() {
       setLocation(cached.loc);
     }
   }, []);
+
+  // Auth listener: load remote data when user logs in
+  useEffect(() => {
+    const unsub = onAuthChange(async (u) => {
+      setUser(u);
+      if (u) {
+        try {
+          const remote = await loadUserData(u.uid);
+          if (remote && remote.days) {
+            setAppData(remote);
+          }
+        } catch (e) {
+          console.warn("Failed to load remote user data", e);
+        }
+      }
+    });
+    return () => unsub && unsub();
+  }, []);
+
+  // Sync to Firestore when appData changes and user is logged in
+  useEffect(() => {
+    let canceled = false;
+    if (user) {
+      (async () => {
+        try {
+          await saveUserData(user.uid, appData);
+        } catch (e) {
+          if (!canceled) console.warn("Failed to save user data", e);
+        }
+      })();
+    }
+    return () => {
+      canceled = true;
+    };
+  }, [appData, user]);
 
   // Fetch prayer times whenever location or date changes (only in ramadan mode)
   const loadPrayerTimes = useCallback(async (loc: LocationInfo) => {
@@ -543,6 +583,50 @@ export default function App() {
       if (countdownRef.current) clearInterval(countdownRef.current);
     };
   }, [prayerTimes, mode]);
+
+  // Service worker update handling: listen for messages from SW and registration state
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (!e.data) return;
+      if (e.data.type === 'SW_ACTIVATED') {
+        console.log('Service worker activated, version', e.data.version);
+      }
+    });
+
+    // Check existing registration for waiting worker
+    (async () => {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (!reg) return;
+        if (reg.waiting) {
+          setSwWaiting(reg.waiting);
+          setUpdateAvailable(true);
+        }
+        reg.addEventListener('updatefound', () => {
+          const newWorker = reg.installing;
+          if (!newWorker) return;
+          newWorker.addEventListener('statechange', () => {
+            if (newWorker.state === 'installed') {
+              if (navigator.serviceWorker.controller) {
+                // new update available
+                setSwWaiting(reg.waiting);
+                setUpdateAvailable(true);
+              }
+            }
+          });
+        });
+      } catch (e) {
+        /* ignore */
+      }
+    })();
+
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (refreshingRef.current) return;
+      refreshingRef.current = true;
+      window.location.reload();
+    });
+  }, []);
 
   // Geolocation handler
   const detectLocation = () => {
@@ -1437,7 +1521,7 @@ export default function App() {
     >
       {/* Header */}
       <header
-        className={`sticky top-0 z-10 backdrop-blur-xl border-b ${
+        className={`sticky top-0 z-10 backdrop-blur-xl border-b safe-top ${
           isDark
             ? "bg-[#0a0f0d]/80 border-white/10"
             : "bg-[#f0f7f4]/80 border-black/10"
@@ -1466,12 +1550,56 @@ export default function App() {
             >
               {isDark ? "☀️" : "🌙"}
             </button>
+            {/* Auth */}
+            {!user ? (
+              <button
+                onClick={async () => {
+                  try {
+                    await signInWithGoogle();
+                  } catch (e) {
+                    console.warn(e);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-xs font-semibold"
+              >
+                Sign in
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <img src={user.photoURL} alt={user.displayName} className="w-8 h-8 rounded-full" />
+                <button
+                  onClick={async () => {
+                    await fbSignOut();
+                    setUser(null);
+                  }}
+                  className="px-3 py-1 rounded-lg bg-white/5 text-xs"
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
 
       {/* Content */}
       <main className="max-w-lg mx-auto px-4 py-6 pb-28">
+        {updateAvailable && swWaiting && (
+          <div className="mb-4 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-between">
+            <div className="text-sm">A new version is available</div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  if (!swWaiting) return;
+                  swWaiting.postMessage({ type: 'SKIP_WAITING' });
+                }}
+                className="px-3 py-1 rounded bg-yellow-500 text-white text-sm"
+              >
+                Update
+              </button>
+            </div>
+          </div>
+        )}
         {tab === "today" && <TodayTab />}
         {tab === "weekly" && <WeeklyTab />}
         {tab === "monthly" && <MonthlyTab />}
@@ -1488,7 +1616,7 @@ export default function App() {
             : "bg-[#f0f7f4]/90 border-black/10"
         }`}
       >
-        <div className="max-w-lg mx-auto flex">
+        <div className="max-w-lg mx-auto flex safe-bottom">
           {TABS.map((t) => (
             <button
               key={t.id}
