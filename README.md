@@ -1,117 +1,109 @@
 # 🌙 DeenHabit — Islamic Habit Tracker PWA
 
-A beautiful, offline-first Progressive Web App for tracking daily Islamic habits.
+A beautiful, offline-first PWA for tracking daily Islamic habits, with optional cloud sync across devices.
+
+---
 
 ## Features
 
-- **Dual Mode**: Toggle between Annual Mode and Ramadan Mode
-- **5 Daily Prayers** with Fard + Sunnah tracking
-- **Quran Reading** with custom daily page goal
-- **Morning & Evening Adhkar** checkboxes
-- **Dhikr Counter** (SubhanAllah / Alhamdulillah / Allahu Akbar) with progress rings
-- **Dua Checklist** for daily duas
-- **Sadaqah** daily charity reminder
-- **Ramadan Extras**: Fasting, Sahur, Iftar, Taraweeh, Tahajjud
-- **Weekly & Monthly visualizations** (bar chart + heatmap calendar)
-- **Dashboard** with streak tracking and prayer consistency stats
-- **Dark / Light mode**
-- **Hijri date display**
-- **100% local** — all data saved in `localStorage`, no backend needed
-- **Installable PWA** — works fully offline
+- **5 Daily Prayers** (Fard + Sunnah), **Quran**, **Adhkar**, **Dhikr Counter**, **Dua Checklist**, **Sadaqah**
+- **Ramadan Mode** — Fasting, Sahur, Iftar, Taraweeh, Tahajjud
+- **Live Prayer Times** — Suhoor/Iftar times for any city + live countdown
+- **Weekly & Monthly visualizations**, **Streak tracker**
+- **Cloud Sync** — sign in to sync across devices (Supabase)
+- **Google OAuth + Email/Password + Magic Link**
+- **Hardened Service Worker** — versioned caches, update toast
+- **Installable PWA**, works fully offline, dark/light mode
 
 ---
 
-## 🚀 Quick Start
-
-### 1. Install dependencies
+## Quick Start
 
 ```bash
 npm install
-```
-
-### 2. Run in development
-
-```bash
 npm run dev
 ```
 
-### 3. Build for production
+The app works fully **without** Supabase — local-only mode uses localStorage.
+
+---
+
+## Cloud Sync Setup (Supabase — optional)
+
+### 1. Create a project at [supabase.com](https://supabase.com) (free tier)
+
+### 2. Run the database schema
+
+Supabase Dashboard → **SQL Editor** → paste & run [`supabase/schema.sql`](./supabase/schema.sql)
+
+### 3. Enable Google OAuth (optional)
+
+Supabase → Authentication → Providers → Google  
+Add callback URL: `https://your-project-ref.supabase.co/auth/v1/callback`
+
+### 4. Add env variables
 
 ```bash
-npm run build
-npm run preview
+cp .env.example .env.local
+# Edit .env.local with your Supabase URL and anon key
 ```
 
 ---
 
-## 📱 Making it a PWA
-
-### Required files (already included):
-| File | Purpose |
-|---|---|
-| `public/manifest.json` | App metadata, icons, display mode |
-| `public/sw.js` | Service worker for offline caching |
-| `index.html` | SW registration + meta tags |
-
-### Icons (you need to add):
-Create `public/icons/` and add:
-- `icon-192.png` — 192×192 px app icon
-- `icon-512.png` — 512×512 px app icon
-
-You can generate them at: https://www.pwabuilder.com/imageGenerator
-
-### Optional: Use `vite-plugin-pwa` for full automation
+## Deploy to Vercel
 
 ```bash
-npm install -D vite-plugin-pwa
+git add . && git commit -m "feat: auth + hardened SW"
+git push
 ```
 
-Then uncomment the `VitePWA(...)` block in `vite.config.ts`.
+Connect your repo at **vercel.com** → New Project → Import.  
+Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in Vercel → Settings → Environment Variables.
 
 ---
 
-## 🗂 Project Structure
+## Bumping the Service Worker Version
+
+Edit `public/sw.js` line 3:
+
+```js
+const SW_VERSION = "2.1.0"; // increment to push an update
+```
+
+Deploy → users see a **"✨ Update available"** toast automatically.
+
+---
+
+## Project Structure
 
 ```
 deenhabit/
-├── public/
-│   ├── manifest.json      # PWA manifest
-│   ├── sw.js              # Service worker
-│   └── icons/             # App icons (add manually)
 ├── src/
-│   ├── App.tsx            # Main application (single file)
-│   └── main.tsx           # React entry point
-├── index.html
-├── vite.config.ts
-├── package.json
-└── tsconfig.json
+│   ├── App.tsx        ← Full app UI + logic
+│   ├── supabase.ts    ← Auth + cloud sync layer
+│   ├── types.ts       ← Shared TypeScript types
+│   ├── main.tsx
+│   └── index.css
+├── public/
+│   ├── sw.js          ← Versioned service worker
+│   ├── manifest.json
+│   └── icons/
+├── supabase/
+│   └── schema.sql     ← Run once in Supabase SQL editor
+├── .env.example
+└── vercel.json
 ```
 
 ---
 
-## 🌙 Ramadan Mode
+## Sync Behaviour
 
-Toggle the **Ramadan** button in the header to switch modes. This adds:
-- Fasting, Sahur, Iftar, Taraweeh, Tahajjud tracking
-- These contribute to your daily progress score
-
----
-
-## 💾 Data Storage
-
-All data is stored in `localStorage` under the key `deenhabit_v1`.
-Format: JSON with a `days` map keyed by `YYYY-MM-DD`.
-
-To export/backup: open DevTools → Application → Local Storage → copy the `deenhabit_v1` value.
-
----
-
-## 🎨 Customization
-
-- **Colors**: Edit Tailwind classes in `App.tsx` (`emerald-500` is the primary)
-- **Habits**: Add to `DUA_LIST`, `PRAYERS`, or the `DayData` type
-- **Dhikr target**: Adjustable in-app
-- **Quran goal**: Adjustable in-app (1–604 pages)
+| Scenario | Result |
+|---|---|
+| First sign-in | Local + cloud data merged, then pushed |
+| Data conflict | Day with more completed prayers wins |
+| Offline edits | Saved locally, synced on next open |
+| New device | Remote data pulled and merged with local |
 
 ---
 

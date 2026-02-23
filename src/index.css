@@ -8,22 +8,27 @@
 
 body {
   overscroll-behavior: none;
+  /* Left/right safe areas for landscape orientation on notched phones */
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 
 @layer utilities {
   .font-arabic {
     font-family: 'Amiri', 'Traditional Arabic', 'Arial Unicode MS', serif;
   }
- 
-  /* Safe-area helpers for iOS home-screen (notch / dynamic island) */
-  .safe-top {
+
+  /* Safe area padding utilities — used on header and bottom nav */
+  .pt-safe {
     padding-top: env(safe-area-inset-top);
-    padding-top: constant(safe-area-inset-top);
   }
-
-  .safe-bottom {
+  .pb-safe {
     padding-bottom: env(safe-area-inset-bottom);
-    padding-bottom: constant(safe-area-inset-bottom);
   }
-
+  .pl-safe {
+    padding-left: env(safe-area-inset-left);
+  }
+  .pr-safe {
+    padding-right: env(safe-area-inset-right);
+  }
 }

@@ -1,7 +1,10 @@
-// DeenHabit Service Worker
-const CACHE_VERSION = 2;
-const CACHE_NAME = `deenhabit-v${CACHE_VERSION}`;
-const ASSETS = [
+// ─── DeenHabit Service Worker ─────────────────────────────────────────────────
+// Bump SW_VERSION to trigger a cache bust + update notification in the UI.
+const SW_VERSION = "2.0.0";
+const CACHE_STATIC = `deenhabit-static-v${SW_VERSION}`;
+const CACHE_API    = `deenhabit-api-v${SW_VERSION}`;
+
+const PRECACHE_URLS = [
   "/",
   "/index.html",
   "/manifest.json",
@@ -9,58 +12,90 @@ const ASSETS = [
   "/icons/icon-512.png",
 ];
 
+const API_HOSTS = ["api.aladhan.com", "nominatim.openstreetmap.org"];
+
+// ─── Install ──────────────────────────────────────────────────────────────────
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+    caches
+      .open(CACHE_STATIC)
+      .then((cache) => cache.addAll(PRECACHE_URLS))
+      .then(() => self.skipWaiting())
   );
-  // wait to activate until explicitly told to skipWaiting by the client
 });
 
+// ─── Activate: purge old caches ───────────────────────────────────────────────
 self.addEventListener("activate", (event) => {
+  const valid = [CACHE_STATIC, CACHE_API];
   event.waitUntil(
     caches
       .keys()
       .then((keys) =>
-        Promise.all(
-          keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
-        )
+        Promise.all(keys.filter((k) => !valid.includes(k)).map((k) => caches.delete(k)))
       )
+      .then(() => self.clients.claim())
+      .then(() => notifyClients({ type: "SW_ACTIVATED", version: SW_VERSION }))
   );
-  // Claim clients immediately so new SW can control pages once activated
-  self.clients.claim();
-  // Notify clients that a new service worker is active
-  self.clients.matchAll().then((clients) => {
-    clients.forEach((c) => c.postMessage({ type: "SW_ACTIVATED", version: CACHE_VERSION }));
-  });
 });
+
+// ─── Fetch ────────────────────────────────────────────────────────────────────
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== "GET") return;
+  if (!url.protocol.startsWith("http")) return;
+
+  if (API_HOSTS.some((h) => url.hostname.includes(h))) {
+    event.respondWith(networkFirst(event.request, CACHE_API));
+    return;
+  }
+  event.respondWith(cacheFirst(event.request, CACHE_STATIC));
+});
+
+// ─── Strategies ───────────────────────────────────────────────────────────────
+async function cacheFirst(request, cacheName) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch {
+    if (request.mode === "navigate") {
+      const fallback = await caches.match("/index.html");
+      if (fallback) return fallback;
+    }
+    return new Response("Offline", { status: 503 });
+  }
+}
+
+async function networkFirst(request, cacheName) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(cacheName);
+      cache.put(request, response.clone());
+    }
+    return response;
+  } catch {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    return new Response(JSON.stringify({ error: "offline" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// ─── Cross-tab messaging ──────────────────────────────────────────────────────
+function notifyClients(payload) {
+  self.clients
+    .matchAll({ includeUncontrolled: true, type: "window" })
+    .then((clients) => clients.forEach((c) => c.postMessage(payload)));
+}
 
 self.addEventListener("message", (event) => {
-  if (!event.data) return;
-  if (event.data.type === "SKIP_WAITING") {
-    self.skipWaiting();
-  }
-});
-
-self.addEventListener("fetch", (event) => {
-  if (event.request.method !== "GET") return;
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request)
-        .then((res) => {
-          // Only cache successful same-origin GET responses
-          if (
-            res &&
-            res.ok &&
-            event.request.method === "GET" &&
-            new URL(event.request.url).origin === self.location.origin
-          ) {
-            const clone = res.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return res;
-        })
-        .catch(() => caches.match("/index.html"));
-    })
-  );
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
 });

@@ -1,11 +1,26 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { onAuthChange, signInWithGoogle, signOut as fbSignOut, saveUserData, loadUserData, auth } from "./firebase";
+import {
+  supabase,
+  isSupabaseConfigured,
+  signInWithGoogle,
+  signInWithEmail,
+  signUpWithEmail,
+  signInMagicLink,
+  signOut,
+  pushToCloud,
+  pullFromCloud,
+  mergeAppData,
+  pullProfile,
+  type User,
+} from "./supabase";
+import ProfileTab, { DEFAULT_PROFILE, loadProfile, saveProfile } from "./ProfileTab";
+import type { UserProfile } from "./types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Mode = "annual" | "ramadan";
 type Theme = "light" | "dark";
-type Tab = "today" | "weekly" | "monthly" | "dhikr" | "dua" | "dashboard";
+type Tab = "today" | "weekly" | "monthly" | "dhikr" | "dua" | "dashboard" | "profile";
 
 interface Prayer {
   id: string;
@@ -452,13 +467,177 @@ function ScoreBar({ label, pct }: { label: string; pct: number }) {
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>("dark");
-  const [user, setUser] = useState<any>(null);
   const [mode, setMode] = useState<Mode>("annual");
   const [tab, setTab] = useState<Tab>("today");
   const [appData, setAppData] = useState<AppData>(loadData);
   const [editGoal, setEditGoal] = useState(false);
   const today = toDateStr(new Date());
   const hijri = toHijri(new Date());
+
+  // ─── Profile State ────────────────────────────────────────────────────────
+  const [profile, setProfile] = useState<UserProfile>(loadProfile);
+
+  function handleProfileChange(p: UserProfile) {
+    setProfile(p);
+    saveProfile(p);
+    // Sync goals back to appData so they stay in sync
+    if (p.quranGoal !== appData.quranGoal || p.dhikrTarget !== appData.dhikrTarget) {
+      setAppData((prev) => ({ ...prev, quranGoal: p.quranGoal, dhikrTarget: p.dhikrTarget }));
+    }
+  }
+
+  // ─── Auth State ───────────────────────────────────────────────────────────
+  const [user, setUser] = useState<User | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authMode, setAuthMode] = useState<"signin" | "signup" | "magic">("signin");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSuccess, setAuthSuccess] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "synced" | "error">("idle");
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const syncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ─── SW Update State ──────────────────────────────────────────────────────
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const [swVersion, setSwVersion] = useState<string | null>(null);
+  const swRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
+
+  // ─── Auth: listen for session changes ─────────────────────────────────────
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  // ─── Auth: sync on login / pull remote data ───────────────────────────────
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
+      setSyncStatus("syncing");
+      // Pull habit data
+      const remote = await pullFromCloud(user.id);
+      if (remote) {
+        const local = loadData();
+        const merged = mergeAppData(local, remote);
+        setAppData(merged);
+        saveData(merged);
+      }
+      // Pull profile
+      const remoteProfile = await pullProfile(user.id);
+      if (remoteProfile) {
+        setProfile({ ...DEFAULT_PROFILE, ...remoteProfile });
+        saveProfile({ ...DEFAULT_PROFILE, ...remoteProfile });
+      }
+      // Push local data up
+      const pushed = await pushToCloud(appData, user.id);
+      setSyncStatus(pushed ? "synced" : "error");
+    })();
+  }, [user]);
+
+  // ─── Auth: debounced auto-sync on data change ─────────────────────────────
+  useEffect(() => {
+    if (!user) return;
+    if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+    syncTimeoutRef.current = setTimeout(async () => {
+      setSyncStatus("syncing");
+      const ok = await pushToCloud(appData, user.id);
+      setSyncStatus(ok ? "synced" : "error");
+    }, 2000); // 2s debounce
+    return () => {
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+    };
+  }, [appData, user]);
+
+  // ─── SW: register and listen for updates ─────────────────────────────────
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    navigator.serviceWorker.register("/sw.js").then((reg) => {
+      swRegistrationRef.current = reg;
+
+      // New SW waiting → show update toast
+      if (reg.waiting) setSwUpdateReady(true);
+
+      reg.addEventListener("updatefound", () => {
+        const newWorker = reg.installing;
+        if (!newWorker) return;
+        newWorker.addEventListener("statechange", () => {
+          if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+            setSwUpdateReady(true);
+          }
+        });
+      });
+    });
+
+    // Listen for SW_ACTIVATED broadcast
+    const onMessage = (event: MessageEvent) => {
+      if (event.data?.type === "SW_ACTIVATED") {
+        setSwVersion(event.data.version);
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
+
+  const applySwUpdate = () => {
+    const reg = swRegistrationRef.current;
+    if (reg?.waiting) {
+      reg.waiting.postMessage({ type: "SKIP_WAITING" });
+    }
+    setSwUpdateReady(false);
+    window.location.reload();
+  };
+
+  // ─── Auth handlers ────────────────────────────────────────────────────────
+  const handleAuthSubmit = async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      if (authMode === "magic") {
+        const { error } = await signInMagicLink(authEmail);
+        if (error) throw error;
+        setAuthSuccess("Magic link sent! Check your email.");
+      } else if (authMode === "signup") {
+        const { error } = await signUpWithEmail(authEmail, authPassword);
+        if (error) throw error;
+        setAuthSuccess("Account created! Check your email to confirm.");
+      } else {
+        const { error } = await signInWithEmail(authEmail, authPassword);
+        if (error) throw error;
+        setShowAuthModal(false);
+      }
+    } catch (err: any) {
+      setAuthError(err.message || "Something went wrong.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const { error } = await signInWithGoogle();
+      if (error) throw error;
+    } catch (err: any) {
+      setAuthError(err.message || "Google sign-in failed.");
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    setShowUserMenu(false);
+    setSyncStatus("idle");
+  };
 
   // ─── Prayer Times State ────────────────────────────────────────────────────
   const [prayerTimes, setPrayerTimes] = useState<PrayerTimes | null>(null);
@@ -470,9 +649,6 @@ export default function App() {
   const [locationSearching, setLocationSearching] = useState(false);
   const [countdown, setCountdown] = useState<{ label: string; secs: number } | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [swWaiting, setSwWaiting] = useState<ServiceWorker | null>(null);
-  const [updateAvailable, setUpdateAvailable] = useState(false);
-  const refreshingRef = useRef(false);
 
   // Load cached prayer times on mount, then fetch fresh
   useEffect(() => {
@@ -482,41 +658,6 @@ export default function App() {
       setLocation(cached.loc);
     }
   }, []);
-
-  // Auth listener: load remote data when user logs in
-  useEffect(() => {
-    const unsub = onAuthChange(async (u) => {
-      setUser(u);
-      if (u) {
-        try {
-          const remote = await loadUserData(u.uid);
-          if (remote && remote.days) {
-            setAppData(remote);
-          }
-        } catch (e) {
-          console.warn("Failed to load remote user data", e);
-        }
-      }
-    });
-    return () => unsub && unsub();
-  }, []);
-
-  // Sync to Firestore when appData changes and user is logged in
-  useEffect(() => {
-    let canceled = false;
-    if (user) {
-      (async () => {
-        try {
-          await saveUserData(user.uid, appData);
-        } catch (e) {
-          if (!canceled) console.warn("Failed to save user data", e);
-        }
-      })();
-    }
-    return () => {
-      canceled = true;
-    };
-  }, [appData, user]);
 
   // Fetch prayer times whenever location or date changes (only in ramadan mode)
   const loadPrayerTimes = useCallback(async (loc: LocationInfo) => {
@@ -583,50 +724,6 @@ export default function App() {
       if (countdownRef.current) clearInterval(countdownRef.current);
     };
   }, [prayerTimes, mode]);
-
-  // Service worker update handling: listen for messages from SW and registration state
-  useEffect(() => {
-    if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.addEventListener('message', (e) => {
-      if (!e.data) return;
-      if (e.data.type === 'SW_ACTIVATED') {
-        console.log('Service worker activated, version', e.data.version);
-      }
-    });
-
-    // Check existing registration for waiting worker
-    (async () => {
-      try {
-        const reg = await navigator.serviceWorker.getRegistration();
-        if (!reg) return;
-        if (reg.waiting) {
-          setSwWaiting(reg.waiting);
-          setUpdateAvailable(true);
-        }
-        reg.addEventListener('updatefound', () => {
-          const newWorker = reg.installing;
-          if (!newWorker) return;
-          newWorker.addEventListener('statechange', () => {
-            if (newWorker.state === 'installed') {
-              if (navigator.serviceWorker.controller) {
-                // new update available
-                setSwWaiting(reg.waiting);
-                setUpdateAvailable(true);
-              }
-            }
-          });
-        });
-      } catch (e) {
-        /* ignore */
-      }
-    })();
-
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (refreshingRef.current) return;
-      refreshingRef.current = true;
-      window.location.reload();
-    });
-  }, []);
 
   // Geolocation handler
   const detectLocation = () => {
@@ -1508,6 +1605,7 @@ export default function App() {
     { id: "dhikr", label: "Dhikr", icon: "📿" },
     { id: "dua", label: "Dua", icon: "🤲" },
     { id: "dashboard", label: "Stats", icon: "📊" },
+    { id: "profile", label: "Profile", icon: profile.avatar || "👤" },
   ];
 
   return (
@@ -1521,11 +1619,12 @@ export default function App() {
     >
       {/* Header */}
       <header
-        className={`sticky top-0 z-10 backdrop-blur-xl border-b safe-top ${
+        className={`sticky top-0 z-10 backdrop-blur-xl border-b ${
           isDark
             ? "bg-[#0a0f0d]/80 border-white/10"
             : "bg-[#f0f7f4]/80 border-black/10"
         }`}
+        style={{ paddingTop: "env(safe-area-inset-top)" }}
       >
         <div className="max-w-lg mx-auto px-4 py-3 flex items-center justify-between">
           <div>
@@ -1535,12 +1634,83 @@ export default function App() {
             <p className="text-xs opacity-40">{hijri}</p>
           </div>
           <div className="flex items-center gap-2">
-            {/* Ramadan badge — shows active state, tapping goes to today tab */}
+            {/* Ramadan badge */}
             {mode === "ramadan" && (
               <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30">
                 🌙 Ramadan
               </span>
             )}
+
+            {/* Sync status indicator */}
+            {user && (
+              <span title={`Sync: ${syncStatus}`} className="text-sm">
+                {syncStatus === "syncing" ? "🔄" : syncStatus === "synced" ? "☁️" : syncStatus === "error" ? "⚠️" : ""}
+              </span>
+            )}
+
+            {/* Auth button / user avatar */}
+            {isSupabaseConfigured ? (
+              user ? (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowUserMenu((v) => !v)}
+                    className="w-9 h-9 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-lg hover:bg-emerald-500/30 transition-colors"
+                  >
+                    {profile.avatar || user.email?.[0]?.toUpperCase() || "U"}
+                  </button>
+                  {showUserMenu && (
+                    <>
+                      {/* Full-screen tap-to-close backdrop — rendered in a portal-like fixed layer */}
+                      <div
+                        className="fixed inset-0"
+                        style={{ zIndex: 998 }}
+                        onClick={() => setShowUserMenu(false)}
+                      />
+                      {/* Dropdown — above the backdrop */}
+                      <div
+                        className={`absolute right-0 top-11 w-56 rounded-2xl border shadow-xl p-2 ${
+                          isDark ? "bg-[#111a14] border-white/10" : "bg-white border-black/10"
+                        }`}
+                        style={{ zIndex: 999 }}
+                      >
+                        <p className="text-xs opacity-50 px-3 py-1 truncate">{user.email}</p>
+                        <div className="my-1 border-t border-white/10" />
+                        <button
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            setSyncStatus("syncing");
+                            const ok = await pushToCloud(appData, user.id);
+                            setSyncStatus(ok ? "synced" : "error");
+                            setShowUserMenu(false);
+                          }}
+                          className="w-full text-left px-3 py-2 rounded-xl text-sm hover:bg-white/5 transition-colors flex items-center gap-2"
+                        >
+                          🔄 <span>Sync now</span>
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleSignOut(); }}
+                          className="w-full text-left px-3 py-2 rounded-xl text-sm hover:bg-red-500/10 text-red-400 transition-colors flex items-center gap-2"
+                        >
+                          🚪 <span>Sign out</span>
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowAuthModal(true)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all border ${
+                    isDark
+                      ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20"
+                      : "bg-emerald-500/10 border-emerald-500/30 text-emerald-700 hover:bg-emerald-500/20"
+                  }`}
+                >
+                  ☁️ Sign in
+                </button>
+              )
+            ) : null}
+
             {/* Theme toggle */}
             <button
               onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
@@ -1550,62 +1720,33 @@ export default function App() {
             >
               {isDark ? "☀️" : "🌙"}
             </button>
-            {/* Auth */}
-            {!user ? (
-              <button
-                onClick={async () => {
-                  try {
-                    await signInWithGoogle();
-                  } catch (e) {
-                    console.warn(e);
-                  }
-                }}
-                className="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-xs font-semibold"
-              >
-                Sign in
-              </button>
-            ) : (
-              <div className="flex items-center gap-2">
-                <img src={user.photoURL} alt={user.displayName} className="w-8 h-8 rounded-full" />
-                <button
-                  onClick={async () => {
-                    await fbSignOut();
-                    setUser(null);
-                  }}
-                  className="px-3 py-1 rounded-lg bg-white/5 text-xs"
-                >
-                  Sign out
-                </button>
-              </div>
-            )}
           </div>
         </div>
       </header>
 
       {/* Content */}
-      <main className="max-w-lg mx-auto px-4 py-6 pb-28">
-        {updateAvailable && swWaiting && (
-          <div className="mb-4 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-between">
-            <div className="text-sm">A new version is available</div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => {
-                  if (!swWaiting) return;
-                  swWaiting.postMessage({ type: 'SKIP_WAITING' });
-                }}
-                className="px-3 py-1 rounded bg-yellow-500 text-white text-sm"
-              >
-                Update
-              </button>
-            </div>
-          </div>
-        )}
+      <main
+        className="max-w-lg mx-auto px-4 py-6"
+        style={{ paddingBottom: "calc(5rem + env(safe-area-inset-bottom))" }}
+      >
         {tab === "today" && <TodayTab />}
         {tab === "weekly" && <WeeklyTab />}
         {tab === "monthly" && <MonthlyTab />}
         {tab === "dhikr" && <DhikrTab />}
         {tab === "dua" && <DuaTab />}
         {tab === "dashboard" && <DashboardTab />}
+        {tab === "profile" && (
+          <ProfileTab
+            profile={profile}
+            onProfileChange={handleProfileChange}
+            user={user}
+            syncStatus={syncStatus}
+            onSignOut={handleSignOut}
+            onShowAuth={() => setShowAuthModal(true)}
+            appData={appData}
+            isDark={isDark}
+          />
+        )}
       </main>
 
       {/* Bottom Nav */}
@@ -1615,8 +1756,9 @@ export default function App() {
             ? "bg-[#0a0f0d]/90 border-white/10"
             : "bg-[#f0f7f4]/90 border-black/10"
         }`}
+        style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       >
-        <div className="max-w-lg mx-auto flex safe-bottom">
+        <div className="max-w-lg mx-auto flex">
           {TABS.map((t) => (
             <button
               key={t.id}
@@ -1638,6 +1780,158 @@ export default function App() {
           ))}
         </div>
       </nav>
+
+      {/* ── SW Update Toast ─────────────────────────────────────────────── */}
+      {swUpdateReady && (
+        <div
+          className="fixed left-1/2 -translate-x-1/2 z-50 w-[calc(100%-2rem)] max-w-sm"
+          style={{ top: "calc(env(safe-area-inset-top) + 0.75rem)" }}
+        >          <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-emerald-900/95 border border-emerald-500/40 shadow-2xl backdrop-blur-xl">
+            <span className="text-xl">✨</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-white">Update available</p>
+              <p className="text-xs text-emerald-300/70">A new version of DeenHabit is ready</p>
+            </div>
+            <button
+              onClick={applySwUpdate}
+              className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-bold transition-colors flex-shrink-0"
+            >
+              Reload
+            </button>
+            <button
+              onClick={() => setSwUpdateReady(false)}
+              className="text-white/40 hover:text-white/70 text-xl leading-none flex-shrink-0"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Auth Modal ──────────────────────────────────────────────────── */}
+      {showAuthModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowAuthModal(false);
+              setAuthError(null);
+              setAuthSuccess(null);
+            }
+          }}
+        >
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <div
+            className={`relative w-full max-w-sm rounded-3xl border p-6 shadow-2xl z-10 ${
+              isDark ? "bg-[#0e1a12] border-white/10" : "bg-white border-black/10"
+            }`}
+          >
+            <button
+              onClick={() => { setShowAuthModal(false); setAuthError(null); setAuthSuccess(null); }}
+              className="absolute top-4 right-4 w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-xl"
+            >×</button>
+
+            <div className="text-center mb-6">
+              <p className="text-3xl mb-2">🌙</p>
+              <h2 className="text-xl font-bold">
+                {authMode === "signup" ? "Create account" : authMode === "magic" ? "Magic link" : "Welcome back"}
+              </h2>
+              <p className="text-xs opacity-50 mt-1">
+                {authMode === "signup"
+                  ? "Save your progress across devices"
+                  : authMode === "magic"
+                  ? "We'll send a sign-in link to your email"
+                  : "Sign in to sync your habits"}
+              </p>
+            </div>
+
+            {/* Google OAuth */}
+            {authMode !== "magic" && (
+              <>
+                <button
+                  onClick={handleGoogleSignIn}
+                  disabled={authLoading}
+                  className={`w-full flex items-center justify-center gap-3 py-3 px-4 rounded-xl border font-semibold text-sm transition-all mb-4 disabled:opacity-50 ${
+                    isDark ? "bg-white/5 border-white/15 hover:bg-white/10" : "bg-black/5 border-black/10 hover:bg-black/10"
+                  }`}
+                >
+                  <svg viewBox="0 0 24 24" className="w-5 h-5 flex-shrink-0">
+                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                  </svg>
+                  Continue with Google
+                </button>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="flex-1 h-px bg-white/10" />
+                  <span className="text-xs opacity-40">or</span>
+                  <div className="flex-1 h-px bg-white/10" />
+                </div>
+              </>
+            )}
+
+            <div className="space-y-3">
+              <input
+                type="email"
+                placeholder="Email address"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && !authLoading && handleAuthSubmit()}
+                className={`w-full px-4 py-3 rounded-xl border text-sm outline-none transition-colors ${
+                  isDark
+                    ? "bg-white/5 border-white/10 focus:border-emerald-500/50 placeholder-white/30"
+                    : "bg-black/5 border-black/10 focus:border-emerald-500/50 placeholder-black/30"
+                }`}
+              />
+              {authMode !== "magic" && (
+                <input
+                  type="password"
+                  placeholder="Password"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && !authLoading && handleAuthSubmit()}
+                  className={`w-full px-4 py-3 rounded-xl border text-sm outline-none transition-colors ${
+                    isDark
+                      ? "bg-white/5 border-white/10 focus:border-emerald-500/50 placeholder-white/30"
+                      : "bg-black/5 border-black/10 focus:border-emerald-500/50 placeholder-black/30"
+                  }`}
+                />
+              )}
+              {authError && (
+                <p className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">{authError}</p>
+              )}
+              {authSuccess && (
+                <p className="text-xs text-emerald-400 bg-emerald-500/10 rounded-lg px-3 py-2">{authSuccess}</p>
+              )}
+              <button
+                onClick={handleAuthSubmit}
+                disabled={authLoading || !authEmail}
+                className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-white font-bold text-sm transition-colors"
+              >
+                {authLoading ? "Please wait…" : authMode === "magic" ? "Send magic link" : authMode === "signup" ? "Create account" : "Sign in"}
+              </button>
+            </div>
+
+            <div className="flex flex-col items-center gap-2 mt-4 text-xs opacity-60">
+              {authMode === "signin" && (<>
+                <button onClick={() => { setAuthMode("signup"); setAuthError(null); setAuthSuccess(null); }} className="hover:opacity-100 underline">Don't have an account? Sign up</button>
+                <button onClick={() => { setAuthMode("magic"); setAuthError(null); setAuthSuccess(null); }} className="hover:opacity-100 underline">Sign in with magic link instead</button>
+              </>)}
+              {authMode === "signup" && (
+                <button onClick={() => { setAuthMode("signin"); setAuthError(null); setAuthSuccess(null); }} className="hover:opacity-100 underline">Already have an account? Sign in</button>
+              )}
+              {authMode === "magic" && (
+                <button onClick={() => { setAuthMode("signin"); setAuthError(null); setAuthSuccess(null); }} className="hover:opacity-100 underline">Sign in with password instead</button>
+              )}
+            </div>
+            <p className="text-center text-xs opacity-30 mt-4">
+              Your data is always saved locally — signing in enables cross-device sync.
+            </p>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
