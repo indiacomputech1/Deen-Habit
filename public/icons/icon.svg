@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="100" fill="#0a0f0d"/>
+  <!-- Crescent moon -->
+  <path d="M310 120 A130 130 0 1 0 310 392 A100 100 0 1 1 310 120Z" fill="#10b981"/>
+  <!-- Star -->
+  <polygon points="340,160 350,190 382,190 357,208 367,238 340,220 313,238 323,208 298,190 330,190"
+           fill="#10b981"/>
+  <!-- DeenHabit wordmark -->
+  <text x="256" y="460" font-family="system-ui,sans-serif" font-size="52" font-weight="700"
+        text-anchor="middle" fill="#10b981" letter-spacing="-1">DeenHabit</text>
+</svg>
